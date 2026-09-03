@@ -817,13 +817,19 @@ class Database:
                     SELECT id, user_id, keyword, normalized_keyword, required_keywords,
                            enabled, hit_count, last_hit_at
                     FROM keywords
-                    WHERE user_id = ? AND enabled = 1
+                    WHERE user_id = ?
                     ORDER BY id ASC
                     """,
                     (user.id,),
                 )
                 keyword_rows = await cursor.fetchall()
                 if not keyword_rows:
+                    has_category_scope = any(
+                        slug.strip() for slug in settings.category_slugs.split(",")
+                    )
+                    if not has_category_scope:
+                        continue
+                elif not any(row[5] for row in keyword_rows):
                     continue
 
                 cursor = await db.execute(

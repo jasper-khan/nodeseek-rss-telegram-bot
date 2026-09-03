@@ -8,6 +8,7 @@ Monitor NodeSeek keywords and push matched new posts to Telegram. Supports multi
 - Keyword combinations, for example `dmit + corona` only matches when all terms appear
 - Block keywords, so matched blocked terms suppress notifications
 - Multi-select category filtering
+- If categories are selected without any keyword rules, monitor all new posts in those categories
 - Multiple delivery targets, up to 10 in total across user chats and communities
 - Delivery history
 - Deduplicated notifications with persisted state
@@ -33,6 +34,8 @@ Common commands:
 - `/status`: show current settings
 - `/pause`: pause notifications
 - `/resume`: resume notifications
+
+Category-wide monitoring: send `/scope tech` (or select one or more other categories) and do not add any keyword rules. The bot will deliver all new posts in the selected categories, while block keywords still apply.
 
 Notes:
 

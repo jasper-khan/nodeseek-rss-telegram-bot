@@ -68,15 +68,16 @@ class FeedPoller:
 
     async def _handle_user(self, bot: Bot, user_record: PollingUserRecord, entries) -> None:
         enabled_keywords = [item for item in user_record.keywords if item.enabled]
-        if not enabled_keywords:
-            return
-        block_keywords = [item.keyword for item in user_record.block_keywords]
-
         category_filter = {
             slug.strip()
             for slug in user_record.settings.category_slugs.split(",")
             if slug.strip()
         }
+        category_only = bool(category_filter) and not user_record.keywords
+        if not enabled_keywords and not category_only:
+            return
+
+        block_keywords = [item.keyword for item in user_record.block_keywords]
 
         if not user_record.settings.initialized and self.settings.mark_as_read_on_first_poll:
             for entry in entries:
@@ -118,11 +119,15 @@ class FeedPoller:
                 )
                 continue
 
-            matched_rules = match_keyword_rules(entry.source_text, enabled_keywords)
-            if not matched_rules:
-                continue
-            matched_keywords = [rule.keyword for rule in matched_rules]
-            matched_keyword_keys = [rule.normalized_keyword for rule in matched_rules]
+            if category_only:
+                matched_keywords = ["板块全量"]
+                matched_keyword_keys = []
+            else:
+                matched_rules = match_keyword_rules(entry.source_text, enabled_keywords)
+                if not matched_rules:
+                    continue
+                matched_keywords = [rule.keyword for rule in matched_rules]
+                matched_keyword_keys = [rule.normalized_keyword for rule in matched_rules]
 
             message = self.formatter.render(
                 title=entry.title,
