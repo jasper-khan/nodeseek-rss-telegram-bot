@@ -6,6 +6,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from app.categories import CATEGORY_ORDER
 from app.utils import normalize_keywords, utc_now_iso
 
 
@@ -36,6 +37,7 @@ class KeywordRecord:
     enabled: bool
     hit_count: int
     last_hit_at: str | None
+    category_slug: str = ""
 
 
 @dataclass(slots=True)
@@ -71,12 +73,39 @@ class DeliveryRecord:
 
 
 @dataclass(slots=True)
+class PendingTargetDeliveryRecord:
+    item_key: str
+    target_id: int
+    chat_id: int
+    message_text: str
+    link: str
+    scope_category_slug: str
+
+
+@dataclass(slots=True)
 class PollingUserRecord:
     user: UserRecord
     settings: UserSettingsRecord
     keywords: list[KeywordRecord]
     block_keywords: list[BlockKeywordRecord]
     targets: list[TargetRecord]
+
+    def rules_for_category(self, category_slug: str | None) -> list[KeywordRecord]:
+        return [
+            rule for rule in self.keywords
+            if not rule.category_slug
+            or (self.settings.category_slugs and rule.category_slug == category_slug)
+        ]
+
+    def has_active_monitoring(self) -> bool:
+        categories = [slug for slug in self.settings.category_slugs.split(",") if slug]
+        if not categories:
+            return any(rule.enabled and not rule.category_slug for rule in self.keywords)
+        for slug in categories:
+            rules = self.rules_for_category(slug)
+            if not rules or any(rule.enabled for rule in rules):
+                return True
+        return False
 
 
 class Database:
@@ -127,7 +156,8 @@ class Database:
                     last_hit_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(user_id, normalized_keyword),
+                    category_slug TEXT NOT NULL DEFAULT '',
+                    UNIQUE(user_id, category_slug, normalized_keyword),
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
                 );
 
@@ -165,10 +195,29 @@ class Database:
                     link TEXT NOT NULL DEFAULT '',
                     category_slug TEXT,
                     matched_keywords TEXT NOT NULL DEFAULT '',
+                    matched_keyword_ids TEXT NOT NULL DEFAULT '',
+                    scope_category_slug TEXT NOT NULL DEFAULT '',
                     delivery_status TEXT NOT NULL DEFAULT 'sent',
                     delivered_at TEXT NOT NULL,
                     UNIQUE(user_id, item_key),
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS target_delivery_history (
+                    user_id INTEGER NOT NULL,
+                    item_key TEXT NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    delivery_status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(delivery_status IN ('pending', 'sent', 'disabled')),
+                    message_text TEXT NOT NULL DEFAULT '',
+                    link TEXT NOT NULL DEFAULT '',
+                    delivered_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, item_key, target_id),
+                    FOREIGN KEY(user_id, item_key)
+                        REFERENCES delivery_history(user_id, item_key) ON DELETE CASCADE,
+                    FOREIGN KEY(target_id) REFERENCES targets(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -180,8 +229,11 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_block_keywords_user_id ON block_keywords(user_id);
                 CREATE INDEX IF NOT EXISTS idx_targets_user_id ON targets(user_id);
                 CREATE INDEX IF NOT EXISTS idx_delivery_history_user_id ON delivery_history(user_id);
+                CREATE INDEX IF NOT EXISTS idx_target_delivery_status
+                    ON target_delivery_history(user_id, item_key, delivery_status);
                 """
             )
+            await db.execute("BEGIN")
             await self._ensure_current_schema(db)
             await self._migrate_legacy_schema(db)
             await db.commit()
@@ -193,11 +245,61 @@ class Database:
             await db.execute(
                 "ALTER TABLE keywords ADD COLUMN required_keywords TEXT NOT NULL DEFAULT ''"
             )
+        if "category_slug" not in columns:
+            # Rebuild to replace the old user-wide UNIQUE constraint, preserving rule IDs.
+            cursor = await db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'keywords'")
+            sequence = await cursor.fetchone()
+            await db.execute(
+                """
+                CREATE TABLE keywords_scoped (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    keyword TEXT NOT NULL,
+                    normalized_keyword TEXT NOT NULL,
+                    required_keywords TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    last_hit_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    category_slug TEXT NOT NULL DEFAULT '',
+                    UNIQUE(user_id, category_slug, normalized_keyword),
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+            await db.execute(
+                """
+                INSERT INTO keywords_scoped (
+                    id, user_id, keyword, normalized_keyword, required_keywords,
+                    enabled, hit_count, last_hit_at, created_at, updated_at
+                )
+                SELECT id, user_id, keyword, normalized_keyword, required_keywords,
+                       enabled, hit_count, last_hit_at, created_at, updated_at
+                FROM keywords
+                """
+            )
+            await db.execute("DROP TABLE keywords")
+            await db.execute("ALTER TABLE keywords_scoped RENAME TO keywords")
+            await db.execute("CREATE INDEX idx_keywords_user_id ON keywords(user_id)")
+            if sequence:
+                await db.execute(
+                    "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'keywords'",
+                    (sequence[0],),
+                )
         cursor = await db.execute("PRAGMA table_info(delivery_history)")
         delivery_columns = {row[1] for row in await cursor.fetchall()}
         if "delivery_status" not in delivery_columns:
             await db.execute(
                 "ALTER TABLE delivery_history ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'sent'"
+            )
+        if "matched_keyword_ids" not in delivery_columns:
+            await db.execute(
+                "ALTER TABLE delivery_history ADD COLUMN matched_keyword_ids TEXT NOT NULL DEFAULT ''"
+            )
+        if "scope_category_slug" not in delivery_columns:
+            await db.execute(
+                "ALTER TABLE delivery_history ADD COLUMN scope_category_slug TEXT NOT NULL DEFAULT ''"
             )
 
     async def _migrate_legacy_schema(self, db: aiosqlite.Connection) -> None:
@@ -460,7 +562,11 @@ class Database:
         tg_user_id: int,
         keyword: str,
         required_terms: list[str] | None = None,
+        *,
+        category_slug: str = "",
     ) -> tuple[bool, KeywordRecord | None]:
+        if category_slug and category_slug not in CATEGORY_ORDER:
+            raise ValueError("Unknown keyword category")
         terms = [
             item.strip().lower()
             for item in (required_terms or [keyword])
@@ -498,22 +604,22 @@ class Database:
                 """
                 INSERT OR IGNORE INTO keywords (
                     user_id, keyword, normalized_keyword, required_keywords,
-                    enabled, hit_count, last_hit_at, created_at, updated_at
+                    enabled, hit_count, last_hit_at, created_at, updated_at, category_slug
                 )
-                VALUES (?, ?, ?, ?, 1, 0, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, 1, 0, NULL, ?, ?, ?)
                 """,
-                (user_id, keyword.strip(), normalized, required_keywords, now, now),
+                (user_id, keyword.strip(), normalized, required_keywords, now, now, category_slug),
             )
             inserted = cursor.rowcount > 0
             await db.commit()
             cursor = await db.execute(
                 """
                 SELECT id, user_id, keyword, normalized_keyword, required_keywords,
-                       enabled, hit_count, last_hit_at
+                       enabled, hit_count, last_hit_at, category_slug
                 FROM keywords
-                WHERE user_id = ? AND normalized_keyword = ?
+                WHERE user_id = ? AND normalized_keyword = ? AND category_slug = ?
                 """,
-                (user_id, normalized),
+                (user_id, normalized, category_slug),
             )
             keyword_row = await cursor.fetchone()
         return inserted, KeywordRecord(*keyword_row) if keyword_row else None
@@ -523,7 +629,7 @@ class Database:
             cursor = await db.execute(
                 """
                 SELECT k.id, k.user_id, k.keyword, k.normalized_keyword,
-                       k.required_keywords, k.enabled, k.hit_count, k.last_hit_at
+                       k.required_keywords, k.enabled, k.hit_count, k.last_hit_at, k.category_slug
                 FROM keywords k
                 JOIN users u ON u.id = k.user_id
                 WHERE u.tg_user_id = ?
@@ -533,6 +639,21 @@ class Database:
             )
             rows = await cursor.fetchall()
         return [KeywordRecord(*row) for row in rows]
+
+    async def set_keyword_category(self, tg_user_id: int, keyword_id: int, category_slug: str) -> bool:
+        if category_slug not in CATEGORY_ORDER:
+            raise ValueError("Unknown keyword category")
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                UPDATE OR IGNORE keywords
+                SET category_slug = ?, updated_at = ?
+                WHERE id = ? AND user_id = (SELECT id FROM users WHERE tg_user_id = ?)
+                """,
+                (category_slug, utc_now_iso(), keyword_id, tg_user_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
 
     async def set_keyword_enabled(self, tg_user_id: int, keyword_id: int, enabled: bool) -> bool:
         async with self._connect() as db:
@@ -631,20 +752,20 @@ class Database:
             await db.commit()
             return cursor.rowcount > 0
 
-    async def bump_keyword_hits(self, user_id: int, normalized_keywords: list[str]) -> None:
-        if not normalized_keywords:
+    async def bump_keyword_hits(self, user_id: int, keyword_ids: list[int]) -> None:
+        if not keyword_ids:
             return
         async with self._connect() as db:
-            for keyword in normalized_keywords:
+            for keyword_id in keyword_ids:
                 await db.execute(
                     """
                     UPDATE keywords
                     SET hit_count = hit_count + 1,
                         last_hit_at = ?,
                         updated_at = ?
-                    WHERE user_id = ? AND normalized_keyword = ?
+                    WHERE user_id = ? AND id = ?
                     """,
-                    (utc_now_iso(), utc_now_iso(), user_id, keyword.lower()),
+                    (utc_now_iso(), utc_now_iso(), user_id, keyword_id),
                 )
             await db.commit()
 
@@ -815,7 +936,7 @@ class Database:
                 cursor = await db.execute(
                     """
                     SELECT id, user_id, keyword, normalized_keyword, required_keywords,
-                           enabled, hit_count, last_hit_at
+                           enabled, hit_count, last_hit_at, category_slug
                     FROM keywords
                     WHERE user_id = ?
                     ORDER BY id ASC
@@ -823,13 +944,14 @@ class Database:
                     (user.id,),
                 )
                 keyword_rows = await cursor.fetchall()
-                if not keyword_rows:
-                    has_category_scope = any(
-                        slug.strip() for slug in settings.category_slugs.split(",")
-                    )
-                    if not has_category_scope:
-                        continue
-                elif not any(row[5] for row in keyword_rows):
+                user_record = PollingUserRecord(
+                    user=user,
+                    settings=settings,
+                    keywords=[KeywordRecord(*item) for item in keyword_rows],
+                    block_keywords=[],
+                    targets=[],
+                )
+                if not user_record.has_active_monitoring():
                     continue
 
                 cursor = await db.execute(
@@ -857,15 +979,9 @@ class Database:
                 if not target_rows:
                     continue
 
-                results.append(
-                    PollingUserRecord(
-                        user=user,
-                        settings=settings,
-                        keywords=[KeywordRecord(*item) for item in keyword_rows],
-                        block_keywords=[BlockKeywordRecord(*item) for item in block_keyword_rows],
-                        targets=[TargetRecord(*item) for item in target_rows],
-                    )
-                )
+                user_record.block_keywords = [BlockKeywordRecord(*item) for item in block_keyword_rows]
+                user_record.targets = [TargetRecord(*item) for item in target_rows]
+                results.append(user_record)
 
         return results
 
@@ -882,6 +998,186 @@ class Database:
             row = await cursor.fetchone()
         return row is not None
 
+    async def get_target_delivery_states(
+        self,
+        user_id: int,
+        item_key: str,
+    ) -> dict[int, str]:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT target_id, delivery_status
+                FROM target_delivery_history
+                WHERE user_id = ? AND item_key = ?
+                ORDER BY target_id ASC
+                """,
+                (user_id, item_key),
+            )
+            rows = await cursor.fetchall()
+        return {int(target_id): str(status) for target_id, status in rows}
+
+    async def list_pending_target_deliveries(
+        self,
+        user_id: int,
+    ) -> list[PendingTargetDeliveryRecord]:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT td.item_key, td.target_id, t.chat_id, td.message_text,
+                       td.link, d.scope_category_slug
+                FROM target_delivery_history td
+                JOIN targets t ON t.id = td.target_id AND t.user_id = td.user_id
+                JOIN delivery_history d
+                  ON d.user_id = td.user_id AND d.item_key = td.item_key
+                WHERE td.user_id = ?
+                  AND td.delivery_status = 'pending'
+                  AND t.enabled = 1
+                ORDER BY td.created_at ASC, td.target_id ASC
+                """,
+                (user_id,),
+            )
+            rows = await cursor.fetchall()
+        return [PendingTargetDeliveryRecord(*row) for row in rows]
+
+    async def prepare_target_delivery(
+        self,
+        user_id: int,
+        item_key: str,
+        target_ids: list[int],
+        *,
+        title: str,
+        link: str,
+        category_slug: str | None,
+        matched_keywords: list[str],
+        matched_keyword_ids: list[int],
+        scope_category_slug: str,
+        message_text: str,
+    ) -> None:
+        now = utc_now_iso()
+        async with self._connect() as db:
+            await db.execute("BEGIN")
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO delivery_history (
+                    user_id, item_key, title, link, category_slug,
+                    matched_keywords, matched_keyword_ids, scope_category_slug,
+                    delivery_status, delivered_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    user_id,
+                    item_key,
+                    title,
+                    link,
+                    category_slug,
+                    ",".join(matched_keywords),
+                    ",".join(str(keyword_id) for keyword_id in matched_keyword_ids),
+                    scope_category_slug,
+                    now,
+                ),
+            )
+            cursor = await db.execute(
+                """
+                SELECT delivery_status
+                FROM delivery_history
+                WHERE user_id = ? AND item_key = ?
+                """,
+                (user_id, item_key),
+            )
+            row = await cursor.fetchone()
+            if row and row[0] == "pending":
+                for target_id in target_ids:
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO target_delivery_history (
+                            user_id, item_key, target_id, delivery_status,
+                            message_text, link, delivered_at, created_at, updated_at
+                        )
+                        SELECT ?, ?, id, 'pending', ?, ?, NULL, ?, ?
+                        FROM targets
+                        WHERE id = ? AND user_id = ? AND enabled = 1
+                        """,
+                        (
+                            user_id,
+                            item_key,
+                            message_text,
+                            link,
+                            now,
+                            now,
+                            target_id,
+                            user_id,
+                        ),
+                    )
+            await db.commit()
+
+    async def set_target_delivery_status(
+        self,
+        user_id: int,
+        item_key: str,
+        target_id: int,
+        status: str,
+    ) -> bool:
+        if status not in {"sent", "disabled"}:
+            raise ValueError("Invalid target delivery status")
+        now = utc_now_iso()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                UPDATE target_delivery_history
+                SET delivery_status = ?,
+                    delivered_at = CASE WHEN ? = 'sent' THEN ? ELSE delivered_at END,
+                    message_text = '',
+                    link = '',
+                    updated_at = ?
+                WHERE user_id = ? AND item_key = ? AND target_id = ?
+                  AND delivery_status = 'pending'
+                """,
+                (status, status, now, now, user_id, item_key, target_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def finalize_target_delivery(self, user_id: int, item_key: str) -> list[int]:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT matched_keyword_ids, delivery_status
+                FROM delivery_history
+                WHERE user_id = ? AND item_key = ?
+                """,
+                (user_id, item_key),
+            )
+            row = await cursor.fetchone()
+            if row is None or row[1] != "pending":
+                return []
+            cursor = await db.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN delivery_status = 'sent' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN delivery_status = 'pending' THEN 1 ELSE 0 END)
+                FROM target_delivery_history
+                WHERE user_id = ? AND item_key = ?
+                """,
+                (user_id, item_key),
+            )
+            sent_count, pending_count = await cursor.fetchone()
+            if not sent_count and pending_count:
+                return []
+            final_status = "sent" if sent_count else "failed"
+            await db.execute(
+                """
+                UPDATE delivery_history
+                SET delivery_status = ?, delivered_at = ?
+                WHERE user_id = ? AND item_key = ? AND delivery_status = 'pending'
+                """,
+                (final_status, utc_now_iso(), user_id, item_key),
+            )
+            await db.commit()
+        if final_status != "sent":
+            return []
+        return [int(value) for value in row[0].split(",") if value]
+
     async def mark_delivered(
         self,
         user_id: int,
@@ -891,6 +1187,7 @@ class Database:
         link: str,
         category_slug: str | None,
         matched_keywords: list[str],
+        matched_keyword_ids: list[int] | None = None,
         delivery_status: str = "sent",
     ) -> None:
         async with self._connect() as db:
@@ -898,9 +1195,10 @@ class Database:
                 """
                 INSERT OR IGNORE INTO delivery_history (
                     user_id, item_key, title, link, category_slug,
-                    matched_keywords, delivery_status, delivered_at
+                    matched_keywords, matched_keyword_ids, scope_category_slug,
+                    delivery_status, delivered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                 """,
                 (
                     user_id,
@@ -909,6 +1207,7 @@ class Database:
                     link,
                     category_slug,
                     ",".join(matched_keywords),
+                    ",".join(str(keyword_id) for keyword_id in (matched_keyword_ids or [])),
                     delivery_status,
                     utc_now_iso(),
                 ),
