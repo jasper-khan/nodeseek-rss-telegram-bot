@@ -6,7 +6,7 @@ import aiohttp
 import feedparser
 
 from app.categories import category_label, normalize_category_slug
-from app.utils import format_datetime, strip_html, truncate_text
+from app.utils import format_datetime, strip_html
 
 
 @dataclass(slots=True)
@@ -47,8 +47,9 @@ class FeedClient:
         for item in parsed.entries[: self.max_entries_per_feed]:
             title = strip_html(item.get("title")) or "无标题"
             link = item.get("link", "").strip()
-            summary = item.get("summary") or item.get("description") or ""
-            plain_summary = truncate_text(strip_html(summary), 280)
+            content = " ".join(part.get("value", "") for part in item.get("content", []))
+            summary = content or item.get("summary") or item.get("description") or ""
+            plain_summary = strip_html(summary)
             published_raw = (
                 item.get("published")
                 or item.get("updated")

@@ -4,12 +4,14 @@ Monitor NodeSeek keywords and push matched new posts to Telegram. Supports multi
 
 ## Features
 
-- Per-keyword add / enable / disable / delete
+- Per-category keyword rules with independent IDs, switches and hit counts
 - Keyword combinations, for example `dmit + corona` only matches when all terms appear
 - Block keywords, so matched blocked terms suppress notifications
 - Multi-select category filtering
-- If categories are selected without any keyword rules, monitor all new posts in those categories
+- Each selected category without applicable rules delivers all its new posts
+- Notifications contain a reminder header, a linked post title and post content, with no separate time or URL line
 - Multiple delivery targets, up to 10 in total across user chats and communities
+- Per-target deduplication and durable retry: only failed targets retry, including after restart or after a post leaves the current RSS window
 - Delivery history
 - Deduplicated notifications with persisted state
 - Multi-user shared deployment
@@ -18,8 +20,14 @@ Monitor NodeSeek keywords and push matched new posts to Telegram. Supports multi
 Common commands:
 
 - `/keywords`: show your keywords
-- `/keywords <kw1,kw2>`: add one or more keywords
-- `/combo <kw1,kw2>`: add a keyword combination that requires all terms
+- `/scope`: choose monitored categories using buttons
+- `/scope tech,trade`: select categories (Chinese category labels also work)
+- `/scope all`: explicitly select every known category, including full monitoring where no rules apply
+- `/keywords <category> <kw1,kw2>`: add keywords to one selected category
+- `/keywords <kw1,kw2>`: choose a category using buttons before saving
+- `/combo <category> <kw1,kw2>`: add a combination requiring all terms within that category
+- `/kwscope <keyword_id> <category>`: rebind an existing rule to a selected category
+- `/cancel`: cancel keyword setup
 - `/on <keyword_id>`: enable a keyword
 - `/off <keyword_id>`: disable a keyword
 - `/delkw <keyword_id>`: delete a keyword
@@ -35,7 +43,43 @@ Common commands:
 - `/pause`: pause notifications
 - `/resume`: resume notifications
 
-Category-wide monitoring: send `/scope tech` (or select one or more other categories) and do not add any keyword rules. The bot will deliver all new posts in the selected categories, while block keywords still apply.
+### Category-specific setup
+
+In the Bot, choose categories through “版块设置”, then click “新建关键词”, select one category and enter keywords. “我的关键词” lists scopes, IDs, switches and hit counts, with a button to rebind each rule. `/status` shows the monitoring mode for each selected category.
+
+For example, after rebinding any legacy global rules:
+
+```text
+/scope tech,trade,daily
+/keywords tech oracle,free
+/combo trade dmit,corona
+```
+
+Technology matches `oracle` OR `free`, trading matches `dmit` AND `corona`, and daily delivers every new post. Block keywords apply across categories. Matching is case-insensitive and uses the RSS title, full available content and category tags.
+
+Disabling every applicable rule pauses a category; deleting its last applicable rule restores full monitoring. Deselecting a category stops its scoped rules without deleting them. `/pause` pauses all notifications for the user.
+
+### Existing databases
+
+Startup migrates the keyword table automatically and preserves rule IDs, enabled states, hit counts and timestamps. Existing targets and post-level history remain intact, while a new per-target delivery table tracks pending and completed sends. If one target succeeds and another fails temporarily, only the failed target retries with the persisted message. New targets do not receive older posts that were already prepared, and a target that blocks the Bot is disabled. Stop the Bot and back up the database before upgrading; restore the matching backup if rolling back the code.
+
+Existing rules are labeled “旧版通用” (legacy global) and retain their original scope. They combine with category-specific rules using OR. Rebind them through the keyword list or `/kwscope <ID> <category>` to make them category-specific. Add separate rules when the same keyword should apply to multiple categories.
+
+Without selected categories, scoped rules stop and full monitoring stays off; legacy global rules still match across categories. `/scope all` explicitly selects all known categories and differs from an unconfigured new account.
+
+### Notification content
+
+Notifications show “NodeSeek 新帖提醒”, “标题：” followed by a linked title, and “摘要：” followed by post content. RSS `content` is preferred, with `summary/description` as fallback. The Bot does not fetch authenticated post pages, so content absent from RSS cannot be recovered.
+
+Keyword matching uses content before truncation. Outgoing messages are capped to Telegram's text limit, with an ellipsis for long content and a 512 UTF-16-unit title cap. All HTML is escaped. Set `DISABLE_WEB_PAGE_PREVIEW=true` to suppress Telegram's optional link preview.
+
+### Local verification
+
+```bash
+python -B -m unittest discover -s tests -v
+```
+
+Tests use temporary SQLite databases and mocked Telegram/RSS responses without live credentials or messages.
 
 Notes:
 
@@ -127,6 +171,6 @@ docker compose up -d --build
 
 ## Privacy
 
-- This project stores Telegram user IDs, chat IDs, keywords, category settings, delivery targets, and delivery history only for notifications.
+- This project stores Telegram user IDs, chat IDs, keywords, category settings, delivery targets, and delivery history only for notifications. Messages pending for temporarily failed targets are stored in SQLite; their message body is cleared after delivery or permanent disablement.
 - Data is stored in the deployer's own SQLite database and is not uploaded to GitHub.
 - Do not expose `.env` or the `data/` directory. If your `BOT_TOKEN` leaks, reset it in BotFather immediately.

@@ -7,7 +7,7 @@ from telegram import Bot, LinkPreviewOptions
 from telegram.error import Forbidden
 
 from app.config import Settings
-from app.db import Database, PollingUserRecord
+from app.db import Database, PendingTargetDeliveryRecord, PollingUserRecord
 from app.formatter import MessageFormatter
 from app.rss import FeedClient, match_keyword_rules, match_keywords
 
@@ -67,14 +67,12 @@ class FeedPoller:
         await asyncio.gather(*(handle_with_limit(user_record) for user_record in users))
 
     async def _handle_user(self, bot: Bot, user_record: PollingUserRecord, entries) -> None:
-        enabled_keywords = [item for item in user_record.keywords if item.enabled]
         category_filter = {
             slug.strip()
             for slug in user_record.settings.category_slugs.split(",")
             if slug.strip()
         }
-        category_only = bool(category_filter) and not user_record.keywords
-        if not enabled_keywords and not category_only:
+        if not user_record.has_active_monitoring():
             return
 
         block_keywords = [item.keyword for item in user_record.block_keywords]
@@ -95,89 +93,168 @@ class FeedPoller:
             return
 
         disabled_target_ids: set[int] = set()
+        pending_deliveries = await self.db.list_pending_target_deliveries(
+            user_record.user.id
+        )
+        for pending in pending_deliveries:
+            if (
+                pending.scope_category_slug
+                and pending.scope_category_slug not in category_filter
+            ):
+                continue
+            await self._send_prepared_target(
+                bot,
+                user_record,
+                pending,
+                disabled_target_ids=disabled_target_ids,
+            )
 
         for entry in entries:
             if category_filter and entry.category_slug not in category_filter:
                 continue
-            if await self.db.is_delivered(user_record.user.id, entry.item_key):
+            target_states = await self.db.get_target_delivery_states(
+                user_record.user.id,
+                entry.item_key,
+            )
+            if target_states:
                 continue
+            else:
+                if await self.db.is_delivered(user_record.user.id, entry.item_key):
+                    continue
 
-            matched_blocks = match_keywords(entry.source_text, block_keywords)
-            if matched_blocks:
-                await self.db.mark_delivered(
-                    user_record.user.id,
-                    entry.item_key,
+                matched_blocks = match_keywords(entry.source_text, block_keywords)
+                if matched_blocks:
+                    await self.db.mark_delivered(
+                        user_record.user.id,
+                        entry.item_key,
+                        title=entry.title,
+                        link=entry.link,
+                        category_slug=entry.category_slug,
+                        matched_keywords=matched_blocks,
+                        delivery_status="blocked",
+                    )
+                    await self.db.bump_block_keyword_hits(
+                        user_record.user.id,
+                        [keyword.lower() for keyword in matched_blocks],
+                    )
+                    continue
+
+                rules = user_record.rules_for_category(entry.category_slug)
+                if not rules:
+                    if not category_filter:
+                        continue
+                    matched_keywords = ["板块全量"]
+                    matched_keyword_ids = []
+                    scope_category_slug = entry.category_slug or ""
+                else:
+                    enabled_keywords = [rule for rule in rules if rule.enabled]
+                    matched_rules = match_keyword_rules(entry.source_text, enabled_keywords)
+                    if not matched_rules:
+                        continue
+                    matched_keywords = [rule.keyword for rule in matched_rules]
+                    matched_keyword_ids = [rule.id for rule in matched_rules]
+                    scope_category_slug = (
+                        ""
+                        if any(not rule.category_slug for rule in matched_rules)
+                        else entry.category_slug or ""
+                    )
+
+                targets = list(user_record.targets)
+                message = self.formatter.render(
                     title=entry.title,
                     link=entry.link,
-                    category_slug=entry.category_slug,
-                    matched_keywords=matched_blocks,
-                    delivery_status="blocked",
+                    summary=entry.summary,
                 )
-                await self.db.bump_block_keyword_hits(
-                    user_record.user.id,
-                    [keyword.lower() for keyword in matched_blocks],
-                )
-                continue
-
-            if category_only:
-                matched_keywords = ["板块全量"]
-                matched_keyword_keys = []
-            else:
-                matched_rules = match_keyword_rules(entry.source_text, enabled_keywords)
-                if not matched_rules:
-                    continue
-                matched_keywords = [rule.keyword for rule in matched_rules]
-                matched_keyword_keys = [rule.normalized_keyword for rule in matched_rules]
-
-            message = self.formatter.render(
-                title=entry.title,
-                link=entry.link,
-                matched_keywords=matched_keywords,
-                category_name=entry.category_name,
-            )
-
-            delivered = False
-            for target in user_record.targets:
-                if target.id in disabled_target_ids:
-                    continue
-                try:
-                    await bot.send_message(
-                        chat_id=target.chat_id,
-                        text=message,
-                        parse_mode="HTML",
-                        link_preview_options=LinkPreviewOptions(
-                            is_disabled=self.settings.disable_web_page_preview,
-                            url=entry.link or None,
-                        ),
-                    )
-                    delivered = True
-                except Forbidden as error:
-                    disabled_target_ids.add(target.id)
-                    await self.db.set_target_enabled(user_record.user.id, target.id, False)
-                    logger.warning(
-                        "Disabled target %s for user %s: %s",
-                        target.id,
-                        user_record.user.tg_user_id,
-                        error.message,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to send item %s to user %s target %s",
-                        entry.item_key,
-                        user_record.user.tg_user_id,
-                        target.chat_id,
-                    )
-
-            if delivered:
-                await self.db.mark_delivered(
+                await self.db.prepare_target_delivery(
                     user_record.user.id,
                     entry.item_key,
+                    [target.id for target in targets],
                     title=entry.title,
                     link=entry.link,
                     category_slug=entry.category_slug,
                     matched_keywords=matched_keywords,
+                    matched_keyword_ids=matched_keyword_ids,
+                    scope_category_slug=scope_category_slug,
+                    message_text=message,
                 )
-                await self.db.bump_keyword_hits(user_record.user.id, matched_keyword_keys)
+
+            for target in targets:
+                await self._send_prepared_target(
+                    bot,
+                    user_record,
+                    PendingTargetDeliveryRecord(
+                        item_key=entry.item_key,
+                        target_id=target.id,
+                        chat_id=target.chat_id,
+                        message_text=message,
+                        link=entry.link,
+                        scope_category_slug=scope_category_slug,
+                    ),
+                    disabled_target_ids=disabled_target_ids,
+                )
 
         if not user_record.settings.initialized:
             await self.db.set_user_initialized(user_record.user.id)
+
+    async def _send_prepared_target(
+        self,
+        bot: Bot,
+        user_record: PollingUserRecord,
+        delivery: PendingTargetDeliveryRecord,
+        *,
+        disabled_target_ids: set[int],
+    ) -> None:
+        if delivery.target_id in disabled_target_ids:
+            return
+        try:
+            await bot.send_message(
+                chat_id=delivery.chat_id,
+                text=delivery.message_text,
+                parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(
+                    is_disabled=self.settings.disable_web_page_preview,
+                    url=delivery.link or None,
+                ),
+            )
+            await self.db.set_target_delivery_status(
+                user_record.user.id,
+                delivery.item_key,
+                delivery.target_id,
+                "sent",
+            )
+        except Forbidden as error:
+            disabled_target_ids.add(delivery.target_id)
+            await self.db.set_target_delivery_status(
+                user_record.user.id,
+                delivery.item_key,
+                delivery.target_id,
+                "disabled",
+            )
+            await self.db.set_target_enabled(
+                user_record.user.id,
+                delivery.target_id,
+                False,
+            )
+            logger.warning(
+                "Disabled target %s for user %s: %s",
+                delivery.target_id,
+                user_record.user.tg_user_id,
+                error.message,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send item %s to user %s target %s",
+                delivery.item_key,
+                user_record.user.tg_user_id,
+                delivery.chat_id,
+            )
+            return
+
+        newly_delivered_keyword_ids = await self.db.finalize_target_delivery(
+            user_record.user.id,
+            delivery.item_key,
+        )
+        await self.db.bump_keyword_hits(
+            user_record.user.id,
+            newly_delivered_keyword_ids,
+        )

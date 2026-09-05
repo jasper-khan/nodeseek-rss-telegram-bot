@@ -37,3 +37,10 @@ def build_category_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
     )
     return InlineKeyboardMarkup(rows)
 
+
+def build_keyword_category_keyboard(selected: set[str], tg_user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(category_label(slug), callback_data=f"kwcategory:{tg_user_id}:{slug}")]
+        for slug in CATEGORY_ORDER if slug in selected
+    ])
+
